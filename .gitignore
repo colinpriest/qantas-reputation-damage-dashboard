@@ -1,0 +1,50 @@
+# Cache files
+unique_events_cache/
+qantas_news_cache/
+qantas_search_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Environment files
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Large data files
+qantas_news_articles/
+unique_events_output/
+qantas_share_price_data.json
+qantas_reputation_news.csv
+qantas_reputation_news.json
+
+# Generated output files
+dashboards/
+*.html
+
+# Cache and analysis files
+*.json
+scrape_summary.json
