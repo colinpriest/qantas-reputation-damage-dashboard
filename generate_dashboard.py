@@ -203,20 +203,50 @@ class DashboardGenerator:
             with open(self.share_price_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
         return {}
+
+    def load_stakeholder_reactions(self) -> Dict:
+        """Load stakeholder reactions data if available"""
+        reactions_file = 'unique_events_output/stakeholder_reactions.json'
+        if os.path.exists(reactions_file):
+            try:
+                with open(reactions_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as ex:
+                print(f"Warning: Failed to load stakeholder reactions: {ex}")
+        else:
+            print("Note: stakeholder reactions file not found. Run stakeholder_reactions.py to generate it.")
+        return {"stakeholders": [], "events": []}
     
     def prepare_timeline_data(self, events: List[Dict], share_data: Dict) -> str:
         """Prepare data for timeline visualization"""
         
         # Filter for reputation damage events only
         reputation_events = [e for e in events if e.get('is_qantas_reputation_damage_event', False)]
-        
+
         # Sort by date
         reputation_events.sort(key=lambda x: x.get('event_date', ''))
-        
+
         # Group events by month for aggregation
         monthly_events = {}
+        # Also enrich events with normalized stakeholders for client-side filtering
+        enriched_events = []
         for event in reputation_events:
             date_str = event.get('event_date', '')
+            # Build normalized stakeholders list on each event for easier client filtering
+            orig_stakeholders = event.get('stakeholders', []) or []
+            normalized_stakeholders = []
+            for stake in orig_stakeholders:
+                try:
+                    normalized_stakeholders.append(self.normalize_stakeholder_category(stake))
+                except Exception:
+                    # Fallback: keep original if normalization fails
+                    normalized_stakeholders.append(stake)
+            # Create a shallow copy with enriched field without mutating the source
+            event_copy = dict(event)
+            event_copy['normalized_stakeholders'] = sorted(list(set(normalized_stakeholders)))
+            enriched_events.append(event_copy)
+
+            # Use the original event for monthly aggregation
             if date_str:
                 try:
                     # Extract YYYY-MM
@@ -229,11 +259,9 @@ class DashboardGenerator:
                             'categories': set(),
                             'stakeholders': set()
                         }
-                    
                     monthly_events[month_key]['events'].append(event)
                     monthly_events[month_key]['total_damage'] += event.get('mean_damage_score', 0)
                     monthly_events[month_key]['count'] += 1
-                    
                     # Add categories and stakeholders (excluding 'reputation' category)
                     for cat in event.get('event_categories', []):
                         if cat.lower() != 'reputation':  # Filter out the 'reputation' category
@@ -241,7 +269,6 @@ class DashboardGenerator:
                     for stake in event.get('stakeholders', []):
                         normalized_stake = self.normalize_stakeholder_category(stake)
                         monthly_events[month_key]['stakeholders'].add(normalized_stake)
-                        
                 except:
                     pass
         
@@ -268,7 +295,7 @@ class DashboardGenerator:
         return {
             'monthly_events': monthly_events,
             'event_markers': event_markers,
-            'reputation_events': reputation_events
+            'reputation_events': enriched_events
         }
     
     def generate_html(self, events_data: Dict, share_data: Dict) -> str:
@@ -306,6 +333,9 @@ class DashboardGenerator:
         .damage-4, .damage-5 {{ background: #f8d7da; color: #842029; }}
         .category-badge {{ display: inline-block; padding: 3px 10px; margin: 2px; border-radius: 15px; font-size: 0.8rem; background-color: #e9ecef; color: #495057; }}
         .section-title {{ font-size: 1.8rem; font-weight: 600; margin-bottom: 25px; color: #2c3e50; }}
+        .toolbar {{ display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }}
+        .table-responsive {{ max-height: 420px; overflow: auto; }}
+        .legend-dot {{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }}
     </style>
 </head>
 <body>
@@ -330,6 +360,49 @@ class DashboardGenerator:
             <div class="col-md-6"><div class="chart-container"><h3 class="section-title"><i class="fas fa-shield-alt"></i> Response Strategies</h3><canvas id="responseChart" height="120"></canvas></div></div>
         </div>
         <div class="chart-container"><h3 class="section-title"><i class="fas fa-fire"></i> High Impact Events (Damage Score ≥ 4)</h3><div id="highImpactEvents" class="row"></div></div>
+        <div class="chart-container">
+            <h3 class="section-title"><i class="fas fa-timeline"></i> Stakeholder Reputation Trajectories (Delta)</h3>
+            <canvas id="stakeholderTrajectory" height="110"></canvas>
+        </div>
+        <div class="chart-container">
+            <h3 class="section-title"><i class="fas fa-people-arrows"></i> Event Reactions Timeline (Customers vs Investors)</h3>
+            <canvas id="eventReactionsTimeline" height="110"></canvas>
+            <p class="text-muted small mt-2">
+                <span class="legend-dot" style="background: #2ecc71"></span>Positive •
+                <span class="legend-dot" style="background: #f1c40f"></span>Neutral •
+                <span class="legend-dot" style="background: #e74c3c"></span>Negative
+            </p>
+        </div>
+        <div class="chart-container">
+            <h3 class="section-title"><i class="fas fa-user-shield"></i> Stakeholder Focus</h3>
+            <div class="toolbar mb-3">
+                <div class="input-group" style="max-width: 420px;">
+                    <label class="input-group-text" for="stakeholderSelect"><i class="fas fa-users"></i></label>
+                    <select class="form-select" id="stakeholderSelect"></select>
+                </div>
+                <button class="btn btn-outline-secondary" id="resetStakeholder"><i class="fas fa-undo"></i> Reset</button>
+            </div>
+            <div class="row">
+                <div class="col-md-6">
+                    <canvas id="stakeholderCategoryChart" height="160"></canvas>
+                </div>
+                <div class="col-md-6">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-hover align-middle">
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Event</th>
+                                    <th>Damage</th>
+                                    <th>Categories</th>
+                                </tr>
+                            </thead>
+                            <tbody id="stakeholderEventsTable"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
     <script>
         JS_CONTENT_PLACEHOLDER
@@ -337,11 +410,23 @@ class DashboardGenerator:
 </body>
 </html>'''
 
+        # Helper to safely embed JSON into <script> tags
+        def safe_json(obj) -> str:
+            s = json.dumps(obj, ensure_ascii=False)
+            # Prevent closing the script tag and handle JS line separators
+            return (
+                s.replace('</', '<\\/')
+                 .replace('\u2028', '\\u2028')
+                 .replace('\u2029', '\\u2029')
+            )
+
         js_template = '''
         const shareData = SHARE_DATA_PLACEHOLDER || [];
         const monthlyEvents = MONTHLY_EVENTS_PLACEHOLDER || {};
         const summary = SUMMARY_PLACEHOLDER || {};
         const highImpactEventsData = HIGH_IMPACT_EVENTS_PLACEHOLDER || [];
+        const allEvents = REPUTATION_EVENTS_PLACEHOLDER || [];
+        const reactionsData = REACTIONS_PLACEHOLDER || {stakeholders: [], events: []};
 
         // Main Timeline Chart
         const ctx1 = document.getElementById('mainTimeline').getContext('2d');
@@ -575,17 +660,232 @@ class DashboardGenerator:
              });
              highImpactContainer.innerHTML = eventsHtml;
          }
+
+        // Stakeholder Reputation Trajectories (Delta)
+        (function() {
+            const ctx = document.getElementById('stakeholderTrajectory');
+            if (!ctx) return;
+            // Exclude CEO and Employees from trajectories plot
+            const stakeholders = (reactionsData.stakeholders || []).filter(n => {
+                const k = (n||'').toLowerCase();
+                return k !== 'ceo' && k !== 'employees';
+            });
+            const events = (reactionsData.events || []).slice().sort((a,b) => (a.event_date||'').localeCompare(b.event_date||''));
+            const palette = ['#e74c3c','#3498db','#2ecc71','#9b59b6','#f39c12','#1abc9c','#e67e22','#34495e'];
+            const datasets = [];
+            stakeholders.forEach((name, idx) => {
+                const data = events.map(e => {
+                    const r = (e.reactions && e.reactions[name]) || {};
+                    const y = (typeof r.reputation_score === 'number') ? r.reputation_score : null;
+                    const prob = (typeof r.reaction_probability === 'number') ? r.reaction_probability : null;
+                    const rationale = r.rationale || '';
+                    return (e.event_date && y !== null) ? { x: e.event_date, y, prob, rationale, label: r.reaction_label || '' } : null;
+                }).filter(Boolean);
+                if (data.length) {
+                    datasets.push({
+                        label: name,
+                        data,
+                        borderColor: palette[idx % palette.length],
+                        backgroundColor: palette[idx % palette.length],
+                        borderWidth: 2,
+                        pointRadius: 2,
+                        tension: 0.2
+                    });
+                }
+            });
+            if (datasets.length) {
+                new Chart(ctx.getContext('2d'), {
+                    type: 'line',
+                    data: { datasets },
+                    options: {
+                        responsive: true,
+                        scales: {
+                            x: { type: 'time', time: { unit: 'month' }, min: '2020-08-01' },
+                            y: { min: -5, max: 5, title: { display: true, text: 'Reputation Delta (-5..5)' } }
+                        },
+                        plugins: {
+                            legend: { position: 'bottom' },
+                            tooltip: {
+                                callbacks: {
+                                    label: (ctx) => {
+                                        const d = ctx.raw;
+                                        return `${ctx.dataset.label}: ${d.label || ''}`.trim();
+                                    },
+                                    afterLabel: (ctx) => {
+                                        const d = ctx.raw;
+                                        const p = (typeof d.prob === 'number') ? d.prob.toFixed(2) : null;
+                                        const probLine = p ? `Probability: ${p}` : '';
+                                        const deltaLine = `Delta: ${d.y}`;
+                                        const rationaleLine = d.rationale ? `\\n${d.rationale}` : '';
+                                        return `${probLine}${probLine ? '\\n' : ''}${deltaLine}${rationaleLine}`;
+                                    }
+                                }
+                            }
+                        },
+                        interaction: { mode: 'index', intersect: false }
+                    }
+                });
+            }
+        })();
+
+        // Event Reactions Timeline (Customers vs Investors) with probability tooltip
+        (function() {
+            const ctx = document.getElementById('eventReactionsTimeline');
+            if (!ctx) return;
+            const events = (reactionsData.events || []).slice().sort((a,b) => (a.event_date||'').localeCompare(b.event_date||''));
+            function colorForScore(s) {
+                if (s >= 2) return 'rgba(46, 204, 113, 0.85)';     // positive delta
+                if (s <= -2) return 'rgba(231, 76, 60, 0.85)';     // negative delta
+                return 'rgba(241, 196, 15, 0.85)';                  // near-neutral
+            }
+            function makeSeries(stakeholder, yVal) {
+                return events.map(e => {
+                    const r = (e.reactions && e.reactions[stakeholder]) || {};
+                    const score = (typeof r.reputation_score === 'number') ? r.reputation_score : null;
+                    if (!e.event_date || score === null) return null;
+                    return {
+                        x: e.event_date,
+                        y: yVal,
+                        score,
+                        label: r.reaction_label || '',
+                        prob: (typeof r.reaction_probability === 'number') ? r.reaction_probability : null,
+                        rationale: r.rationale || ''
+                    };
+                }).filter(Boolean);
+            }
+            const custKey = (reactionsData.stakeholders || []).find(s => s.toLowerCase().startsWith('customer')) || 'Customers';
+            const invKey = (reactionsData.stakeholders || []).find(s => s.toLowerCase().startsWith('invest')) || 'Investors';
+            const cust = makeSeries(custKey, 1);
+            const inv = makeSeries(invKey, 2);
+            new Chart(ctx.getContext('2d'), {
+                type: 'scatter',
+                data: {
+                    datasets: [
+                        { label: 'Customers', data: cust, pointBackgroundColor: cust.map(p => colorForScore(p.score)), pointRadius: 5 },
+                        { label: 'Investors', data: inv, pointBackgroundColor: inv.map(p => colorForScore(p.score)), pointRadius: 5 }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: { type: 'time', time: { unit: 'month' }, min: '2020-08-01' },
+                        y: { display: false, min: 0, max: 3 }
+                    },
+                    plugins: {
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => {
+                                    const d = ctx.raw; return `${ctx.dataset.label}: ${d.label}`;
+                                },
+                                afterLabel: (ctx) => {
+                                    const d = ctx.raw;
+                                    const p = (typeof d.prob === 'number') ? d.prob.toFixed(2) : null;
+                                    const probLine = p ? `Probability: ${p}` : '';
+                                    const deltaLine = `Delta: ${d.score}`;
+                                    const rationaleLine = d.rationale ? `\\n${d.rationale}` : '';
+                                    return `${probLine}${probLine ? '\\n' : ''}${deltaLine}${rationaleLine}`;
+                                }
+                            }
+                        },
+                        legend: { position: 'bottom' }
+                    }
+                }
+            });
+        })();
+
+        // Stakeholder Focus: dropdown, filtered table, and category chart
+        const stakeholderSelect = document.getElementById('stakeholderSelect');
+        const stakeholderEventsTable = document.getElementById('stakeholderEventsTable');
+        const resetStakeholderBtn = document.getElementById('resetStakeholder');
+        const stakeholderCategoryCtx = document.getElementById('stakeholderCategoryChart').getContext('2d');
+
+        // Populate stakeholder list from summary
+        const stakeholderDataAll = summary.affected_stakeholders || {};
+        const stakeholdersSorted = Object.keys(stakeholderDataAll).sort((a,b) => (stakeholderDataAll[b]||0) - (stakeholderDataAll[a]||0));
+        stakeholderSelect.innerHTML = ['<option value="">Select a stakeholder...</option>'].concat(stakeholdersSorted.map(s => `<option value="${s}">${s}</option>`)).join('');
+
+        let stakeholderCategoryChartInstance = null;
+
+        function renderStakeholderFocus(selected) {
+            // Filter events by normalized stakeholders
+            const filtered = !selected ? [] : allEvents.filter(ev => Array.isArray(ev.normalized_stakeholders) && ev.normalized_stakeholders.includes(selected));
+
+            // Build table rows (limit 50)
+            const rows = filtered
+                .sort((a,b) => (b.mean_damage_score||0) - (a.mean_damage_score||0))
+                .slice(0, 50)
+                .map(ev => {
+                    const cats = (ev.event_categories||[]).filter(c => (c||'').toLowerCase() !== 'reputation');
+                    const catsHtml = cats.map(c => `<span class="category-badge">${c}</span>`).join('');
+                    const date = (ev.event_date||'').substring(0,10);
+                    const dmg = (ev.mean_damage_score||0).toFixed(1);
+                    return `<tr>
+                        <td class="text-nowrap">${date}</td>
+                        <td>${ev.event_name||'Unnamed Event'}</td>
+                        <td><span class="damage-score damage-${Math.round(ev.mean_damage_score||0)}">${dmg}</span></td>
+                        <td>${catsHtml}</td>
+                    </tr>`;
+                }).join('');
+            stakeholderEventsTable.innerHTML = rows || '<tr><td colspan="4" class="text-muted">Select a stakeholder to view related events.</td></tr>';
+
+            // Aggregate categories for chart
+            const categoryCounts = {};
+            filtered.forEach(ev => {
+                (ev.event_categories||[]).forEach(cat => {
+                    if ((cat||'').toLowerCase() === 'reputation') return;
+                    categoryCounts[cat] = (categoryCounts[cat]||0) + 1;
+                })
+            });
+
+            const labels = Object.keys(categoryCounts);
+            const data = Object.values(categoryCounts);
+
+            if (stakeholderCategoryChartInstance) {
+                stakeholderCategoryChartInstance.destroy();
+            }
+            stakeholderCategoryChartInstance = new Chart(stakeholderCategoryCtx, {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: selected ? `Categories impacting: ${selected}` : 'Categories',
+                        data,
+                        backgroundColor: 'rgba(54, 162, 235, 0.8)'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { display: false } },
+                    scales: { x: { ticks: { autoSkip: false, maxRotation: 45, minRotation: 0 } } }
+                }
+            });
+        }
+
+        stakeholderSelect.addEventListener('change', (e) => {
+            renderStakeholderFocus(e.target.value || '');
+        });
+        resetStakeholderBtn.addEventListener('click', () => {
+            stakeholderSelect.value = '';
+            renderStakeholderFocus('');
+        });
+
+        // Initial render (empty state)
+        renderStakeholderFocus('');
         '''
         
         # Safely inject JSON into the JS template
         js_content = js_template.replace(
-            'SHARE_DATA_PLACEHOLDER', json.dumps(share_data.get('data', []), ensure_ascii=False)
+            'SHARE_DATA_PLACEHOLDER', safe_json(share_data.get('data', []))
         ).replace(
-            'MONTHLY_EVENTS_PLACEHOLDER', json.dumps(timeline_data['monthly_events'], ensure_ascii=False)
+            'MONTHLY_EVENTS_PLACEHOLDER', safe_json(timeline_data['monthly_events'])
         ).replace(
-            'SUMMARY_PLACEHOLDER', json.dumps(summary, ensure_ascii=False)
+            'SUMMARY_PLACEHOLDER', safe_json(summary)
         ).replace(
-            'HIGH_IMPACT_EVENTS_PLACEHOLDER', json.dumps(high_impact_events, ensure_ascii=False)
+            'HIGH_IMPACT_EVENTS_PLACEHOLDER', safe_json(high_impact_events)
+        ).replace(
+            'REPUTATION_EVENTS_PLACEHOLDER', safe_json(timeline_data['reputation_events'])
+        ).replace(
+            'REACTIONS_PLACEHOLDER', safe_json(self.load_stakeholder_reactions())
         )
 
         # Inject the completed JS into the main HTML template
