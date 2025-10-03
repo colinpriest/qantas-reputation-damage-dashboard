@@ -8,9 +8,11 @@ umap-learn==0.5.7
 # Web scraping and API clients
 playwright==1.48.0
 requests==2.32.3
+urllib3>=1.26.0
 beautifulsoup4==4.12.3
-yfinance==0.2.50
+yfinance==0.2.66
 python-dotenv==1.0.1
+PyPDF2==3.0.1
 
 # AI/ML - OpenAI and related
 openai==1.54.5
@@ -31,3 +33,4 @@ seaborn==0.13.2
 
 # Utilities
 tqdm==4.67.1
+
