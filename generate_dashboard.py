@@ -13,12 +13,14 @@ class DashboardGenerator:
     def __init__(self):
         self.unique_events_file = 'unique_events_output/unique_events_chatgpt_v2.json'
         self.share_price_file = 'qantas_share_price_data.json'
-        
+        self.activism_file = 'shareholder_activism_results.json'
+        self.share_price_drops_file = 'qantas_share_price_drops.csv'
+
         # Create dashboards directory if it doesn't exist
         self.dashboards_dir = 'dashboards'
         if not os.path.exists(self.dashboards_dir):
             os.makedirs(self.dashboards_dir)
-            
+
         self.output_file = os.path.join(self.dashboards_dir, 'qantas_reputation_dashboard.html')
         
     def load_unique_events_data(self) -> Dict:
@@ -216,6 +218,178 @@ class DashboardGenerator:
         else:
             print("Note: stakeholder reactions file not found. Run stakeholder_reactions.py to generate it.")
         return {"stakeholders": [], "events": []}
+
+    def load_activism_data(self) -> List[Dict]:
+        """Load shareholder activism data"""
+        if os.path.exists(self.activism_file):
+            print(f"Loading activism data from {self.activism_file}...")
+            with open(self.activism_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            print(f"Loaded {len(data)} AGM records")
+            return data
+        else:
+            print(f"Warning: Activism file not found at {self.activism_file}")
+            return []
+
+    def prepare_agm_remuneration_data(self, activism_data: List[Dict]) -> Dict:
+        """Prepare AGM remuneration protest vote data for line chart"""
+        # Group by year and find the results document (not notice) with remuneration data
+        remuneration_by_year = {}
+
+        for record in activism_data:
+            year = record.get('year')
+            doc_type = record.get('document_type', '')
+            activism = record.get('activism_analysis', {})
+            remuneration = activism.get('remuneration_voting')
+
+            # Only use results documents with actual voting data
+            if remuneration and remuneration.get('votes_against_percentage') is not None:
+                # Prefer results documents over notices
+                if year not in remuneration_by_year or doc_type == 'results':
+                    remuneration_by_year[year] = remuneration.get('votes_against_percentage', 0)
+
+        # Sort by year and determine strike types
+        years_sorted = sorted(remuneration_by_year.keys())
+        percentages = []
+        strike_types = []
+
+        for i, year in enumerate(years_sorted):
+            pct = remuneration_by_year[year]
+            percentages.append(pct)
+
+            # Determine strike type
+            if pct >= 25:
+                # Check if previous year also had a strike
+                if i > 0 and years_sorted[i-1] == year - 1:
+                    prev_pct = remuneration_by_year.get(years_sorted[i-1], 0)
+                    if prev_pct >= 25:
+                        strike_types.append('second')
+                    else:
+                        strike_types.append('first')
+                else:
+                    strike_types.append('first')
+            else:
+                strike_types.append('none')
+
+        return {
+            'years': years_sorted,
+            'percentages': percentages,
+            'strike_types': strike_types
+        }
+
+    def prepare_protest_votes_data(self, activism_data: List[Dict]) -> Dict:
+        """Prepare protest votes category counts for bar chart"""
+        # Count by year and category
+        votes_by_year = {}
+
+        # First, get the best remuneration data per year (prefer results documents)
+        remuneration_by_year = {}
+        for record in activism_data:
+            year = record.get('year')
+            doc_type = record.get('document_type', '')
+            activism = record.get('activism_analysis', {})
+            remuneration = activism.get('remuneration_voting')
+
+            # Only use documents with actual voting data
+            if remuneration and remuneration.get('votes_against_percentage') is not None:
+                # Prefer results documents over notices/unknown
+                if year not in remuneration_by_year or doc_type == 'results':
+                    remuneration_by_year[year] = {
+                        'votes_against_percentage': remuneration.get('votes_against_percentage', 0),
+                        'first_strike': activism.get('first_strike', False),
+                        'second_strike': activism.get('second_strike', False)
+                    }
+
+        # Now process all years to count strikes properly
+        for record in activism_data:
+            year = record.get('year')
+            activism = record.get('activism_analysis', {})
+
+            if year not in votes_by_year:
+                votes_by_year[year] = {
+                    'unsuccessful_activism': 0,
+                    'contentious_resolutions': 0,
+                    'first_strike': 0,
+                    'second_strike': 0
+                }
+
+            # Count unsuccessful activism (10-20% opposition)
+            unsuccessful = activism.get('unsuccessful_activism', [])
+            if unsuccessful:
+                votes_by_year[year]['unsuccessful_activism'] = max(votes_by_year[year]['unsuccessful_activism'], len(unsuccessful))
+
+            # Count contentious resolutions (>20% opposition)
+            contentious = activism.get('contentious_resolutions', [])
+            if contentious:
+                votes_by_year[year]['contentious_resolutions'] = max(votes_by_year[year]['contentious_resolutions'], len(contentious))
+
+        # Now determine first vs second strikes based on consecutive years
+        years_sorted = sorted(remuneration_by_year.keys())
+        for i, year in enumerate(years_sorted):
+            rem_data = remuneration_by_year[year]
+
+            # Check if this year had 25%+ opposition
+            if rem_data['votes_against_percentage'] >= 25:
+                # Check if previous year also had 25%+ opposition
+                if i > 0:
+                    prev_year = years_sorted[i - 1]
+                    prev_rem_data = remuneration_by_year.get(prev_year, {})
+
+                    # If previous year was a strike (first or second), this is a second strike
+                    if prev_rem_data.get('votes_against_percentage', 0) >= 25:
+                        votes_by_year[year]['second_strike'] = 1
+                        votes_by_year[year]['first_strike'] = 0
+                    else:
+                        votes_by_year[year]['first_strike'] = 1
+                else:
+                    # First year in data with strike
+                    votes_by_year[year]['first_strike'] = 1
+
+        # Sort by year and prepare data
+        years = sorted(votes_by_year.keys())
+        unsuccessful = [votes_by_year[y]['unsuccessful_activism'] for y in years]
+        contentious = [votes_by_year[y]['contentious_resolutions'] for y in years]
+        first_strikes = [votes_by_year[y]['first_strike'] for y in years]
+        second_strikes = [votes_by_year[y]['second_strike'] for y in years]
+
+        return {
+            'years': years,
+            'unsuccessful_activism': unsuccessful,
+            'contentious_resolutions': contentious,
+            'first_strike': first_strikes,
+            'second_strike': second_strikes
+        }
+
+    def load_share_price_drops_data(self) -> Dict:
+        """Load and prepare share price drops data for quarterly chart"""
+        if not os.path.exists(self.share_price_drops_file):
+            print(f"Warning: Share price drops file not found at {self.share_price_drops_file}")
+            return {'quarters': [], 'counts': []}
+
+        print(f"Loading share price drops from {self.share_price_drops_file}...")
+
+        import pandas as pd
+        df = pd.read_csv(self.share_price_drops_file)
+
+        # Filter for drops > 3%
+        significant_drops = df[df['qantas_drop_percent'] < -3.0].copy()
+
+        # Convert date to datetime
+        significant_drops['date'] = pd.to_datetime(significant_drops['date'])
+
+        # Extract year and quarter
+        significant_drops['year'] = significant_drops['date'].dt.year
+        significant_drops['quarter'] = significant_drops['date'].dt.quarter
+        significant_drops['quarter_label'] = significant_drops['year'].astype(str) + ' Q' + significant_drops['quarter'].astype(str)
+
+        # Count by quarter
+        quarter_counts = significant_drops.groupby('quarter_label').size().reset_index(name='count')
+        quarter_counts = quarter_counts.sort_values('quarter_label')
+
+        return {
+            'quarters': quarter_counts['quarter_label'].tolist(),
+            'counts': quarter_counts['count'].tolist()
+        }
     
     def prepare_timeline_data(self, events: List[Dict], share_data: Dict) -> str:
         """Prepare data for timeline visualization"""
@@ -298,12 +472,16 @@ class DashboardGenerator:
             'reputation_events': enriched_events
         }
     
-    def generate_html(self, events_data: Dict, share_data: Dict) -> str:
+    def generate_html(self, events_data: Dict, share_data: Dict, activism_data: List[Dict], share_price_drops_data: Dict) -> str:
         """Generate the HTML dashboard"""
-        
+
         timeline_data = self.prepare_timeline_data(events_data['events'], share_data)
         summary = events_data.get('summary', {})
         high_impact_events = summary.get("high_severity_events", [])
+
+        # Prepare activism charts data
+        agm_remuneration_data = self.prepare_agm_remuneration_data(activism_data)
+        protest_votes_data = self.prepare_protest_votes_data(activism_data)
         
         # The core HTML structure, a basic template.
         html_template = '''<!DOCTYPE html>
@@ -400,6 +578,30 @@ class DashboardGenerator:
                             <tbody id="stakeholderEventsTable"></tbody>
                         </table>
                     </div>
+                </div>
+            </div>
+        </div>
+        <div class="chart-container">
+            <h3 class="section-title"><i class="fas fa-chart-line"></i> AGM Remuneration Protest Votes</h3>
+            <canvas id="remunerationProtestChart" height="100"></canvas>
+            <p class="text-muted small mt-2">Annual percentage of votes cast against the remuneration motion at Qantas AGMs.
+            <span style="color: #007bff;">●</span> Normal (<25%),
+            <span style="color: #dc3545;">●</span> First Strike (25%+),
+            <span style="color: #6f1319;">●</span> Second Strike (consecutive years 25%+ = board spill risk).</p>
+        </div>
+        <div class="row">
+            <div class="col-md-6">
+                <div class="chart-container">
+                    <h3 class="section-title"><i class="fas fa-vote-yea"></i> All Protest Votes</h3>
+                    <canvas id="protestVotesChart" height="140"></canvas>
+                    <p class="text-muted small mt-2">Count of AGM resolutions by protest category: Unsuccessful Activism (10-20% against), Contentious Resolutions (>20% against), First Strike (25%+ against remuneration), Second Strike (consecutive years of 25%+ opposition triggering board spill risk).</p>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="chart-container">
+                    <h3 class="section-title"><i class="fas fa-chart-bar"></i> Days with Significant Share Price Drops</h3>
+                    <canvas id="sharePriceDropsChart" height="140"></canvas>
+                    <p class="text-muted small mt-2">Quarterly count of trading days when Qantas share price dropped by more than 3%.</p>
                 </div>
             </div>
         </div>
@@ -871,6 +1073,221 @@ class DashboardGenerator:
 
         // Initial render (empty state)
         renderStakeholderFocus('');
+
+        // AGM Remuneration Protest Votes Chart
+        const remunerationData = AGM_REMUNERATION_DATA_PLACEHOLDER || {years: [], percentages: [], strike_types: []};
+        const remunerationCtx = document.getElementById('remunerationProtestChart').getContext('2d');
+
+        // Create point colors based on strike type
+        const pointColors = (remunerationData.strike_types || []).map(type => {
+            if (type === 'second') return '#6f1319';  // Dark red for second strike
+            if (type === 'first') return '#dc3545';   // Red for first strike
+            return '#007bff';  // Blue for no strike
+        });
+
+        const pointRadii = (remunerationData.strike_types || []).map(type => {
+            if (type === 'second') return 10;  // Larger for second strike
+            if (type === 'first') return 8;    // Medium for first strike
+            return 4;  // Small for no strike
+        });
+
+        new Chart(remunerationCtx, {
+            type: 'line',
+            data: {
+                labels: remunerationData.years,
+                datasets: [{
+                    label: '% Votes Against Remuneration',
+                    data: remunerationData.percentages,
+                    borderColor: '#dc3545',
+                    backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                    fill: true,
+                    tension: 0.3,
+                    pointBackgroundColor: pointColors,
+                    pointBorderColor: pointColors,
+                    pointRadius: pointRadii,
+                    pointHoverRadius: pointRadii.map(r => r + 3),
+                    borderWidth: 3
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { display: true, position: 'top' },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                let label = context.dataset.label || '';
+                                if (label) {
+                                    label += ': ';
+                                }
+                                label += context.parsed.y.toFixed(2) + '%';
+                                const strikeType = remunerationData.strike_types[context.dataIndex];
+                                if (strikeType === 'second') {
+                                    label += ' ⚠️ SECOND STRIKE (Board Spill Risk!)';
+                                } else if (strikeType === 'first') {
+                                    label += ' (First Strike)';
+                                }
+                                return label;
+                            }
+                        }
+                    },
+                    annotation: {
+                        annotations: {
+                            line1: {
+                                type: 'line',
+                                yMin: 25,
+                                yMax: 25,
+                                borderColor: '#ffc107',
+                                borderWidth: 2,
+                                borderDash: [5, 5],
+                                label: {
+                                    content: 'Strike Threshold (25%)',
+                                    enabled: true,
+                                    position: 'end'
+                                }
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: { display: true, text: 'Percentage (%)' },
+                        ticks: {
+                            callback: function(value) {
+                                return value + '%';
+                            }
+                        }
+                    },
+                    x: {
+                        title: { display: true, text: 'Year' }
+                    }
+                }
+            }
+        });
+
+        // All Protest Votes Chart
+        const protestVotesData = PROTEST_VOTES_DATA_PLACEHOLDER || {years: [], unsuccessful_activism: [], contentious_resolutions: [], first_strike: [], second_strike: []};
+        const protestVotesCtx = document.getElementById('protestVotesChart').getContext('2d');
+        new Chart(protestVotesCtx, {
+            type: 'bar',
+            data: {
+                labels: protestVotesData.years,
+                datasets: [
+                    {
+                        label: 'Unsuccessful Activism (10-20%)',
+                        data: protestVotesData.unsuccessful_activism,
+                        backgroundColor: '#ffc107',
+                        borderColor: '#e0a800',
+                        borderWidth: 1
+                    },
+                    {
+                        label: 'Contentious Resolutions (>20%)',
+                        data: protestVotesData.contentious_resolutions,
+                        backgroundColor: '#fd7e14',
+                        borderColor: '#dc6502',
+                        borderWidth: 1
+                    },
+                    {
+                        label: 'First Strike (25%+ remuneration)',
+                        data: protestVotesData.first_strike,
+                        backgroundColor: '#dc3545',
+                        borderColor: '#b02a37',
+                        borderWidth: 1
+                    },
+                    {
+                        label: 'Second Strike (consecutive 25%+)',
+                        data: protestVotesData.second_strike,
+                        backgroundColor: '#6f1319',
+                        borderColor: '#4a0c11',
+                        borderWidth: 1
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { display: true, position: 'top' },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                let label = context.dataset.label || '';
+                                if (label) {
+                                    label += ': ';
+                                }
+                                if (context.parsed.y > 0) {
+                                    label += context.parsed.y;
+                                    if (label.includes('Second Strike')) {
+                                        label += ' ⚠️ BOARD SPILL RISK';
+                                    }
+                                }
+                                return label;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: { display: true, text: 'Count' },
+                        ticks: { stepSize: 1 }
+                    },
+                    x: {
+                        title: { display: true, text: 'Year' },
+                        stacked: false
+                    }
+                }
+            }
+        });
+
+        // Days with Significant Share Price Drops Chart
+        const sharePriceDropsData = SHARE_PRICE_DROPS_DATA_PLACEHOLDER || {quarters: [], counts: []};
+        const sharePriceDropsCtx = document.getElementById('sharePriceDropsChart').getContext('2d');
+        new Chart(sharePriceDropsCtx, {
+            type: 'bar',
+            data: {
+                labels: sharePriceDropsData.quarters,
+                datasets: [{
+                    label: 'Days with >3% Drop',
+                    data: sharePriceDropsData.counts,
+                    backgroundColor: '#e74c3c',
+                    borderColor: '#c0392b',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { display: true, position: 'top' },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                let label = context.dataset.label || '';
+                                if (label) {
+                                    label += ': ';
+                                }
+                                label += context.parsed.y + ' day' + (context.parsed.y !== 1 ? 's' : '');
+                                return label;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: { display: true, text: 'Number of Days' },
+                        ticks: { stepSize: 1 }
+                    },
+                    x: {
+                        title: { display: true, text: 'Quarter' },
+                        ticks: {
+                            maxRotation: 45,
+                            minRotation: 45
+                        }
+                    }
+                }
+            }
+        });
         '''
         
         # Safely inject JSON into the JS template
@@ -886,6 +1303,12 @@ class DashboardGenerator:
             'REPUTATION_EVENTS_PLACEHOLDER', safe_json(timeline_data['reputation_events'])
         ).replace(
             'REACTIONS_PLACEHOLDER', safe_json(self.load_stakeholder_reactions())
+        ).replace(
+            'AGM_REMUNERATION_DATA_PLACEHOLDER', safe_json(agm_remuneration_data)
+        ).replace(
+            'PROTEST_VOTES_DATA_PLACEHOLDER', safe_json(protest_votes_data)
+        ).replace(
+            'SHARE_PRICE_DROPS_DATA_PLACEHOLDER', safe_json(share_price_drops_data)
         )
 
         # Inject the completed JS into the main HTML template
@@ -904,26 +1327,32 @@ class DashboardGenerator:
         """Main method to generate the dashboard"""
         print("Loading unique events data...")
         events_data = self.load_unique_events_data()
-        
+
         print("Loading share price data...")
         share_data = self.load_share_price_data()
-        
+
+        print("Loading activism data...")
+        activism_data = self.load_activism_data()
+
+        print("Loading share price drops data...")
+        share_price_drops_data = self.load_share_price_drops_data()
+
         if not events_data['events']:
             print("Warning: No unique events data found. Run unique_event_detection.py first.")
-        
+
         if not share_data:
             print("Warning: No share price data found. Run fetch_share_price.py first.")
-        
+
         print("Generating HTML dashboard...")
-        html_content = self.generate_html(events_data, share_data)
-        
+        html_content = self.generate_html(events_data, share_data, activism_data, share_price_drops_data)
+
         # Save HTML file
         with open(self.output_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
-        
+
         print(f"\nDashboard generated: {self.output_file}")
         print(f"Open {self.output_file} in a web browser to view the dashboard.")
-        
+
         return self.output_file
 
 
