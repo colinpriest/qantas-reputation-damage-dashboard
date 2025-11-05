@@ -877,6 +877,30 @@ class ACCR:
         scored_events.sort(key=lambda x: x[1], reverse=True)
         return [event for event, score in scored_events[:3]]
     
+    def _correct_event_date(self, event_name: str, original_date: str) -> str:
+        """
+        Correct known misdated events based on event name patterns.
+        
+        Args:
+            event_name: Name of the event
+            original_date: Original date from source data
+            
+        Returns:
+            Corrected date string or original date if no correction needed
+        """
+        # Known date corrections for misdated events
+        date_corrections = {
+            "Qantas Fleet Grounding Over Union Dispute": "2011-10-29",  # Correct date for 2011 fleet grounding
+        }
+        
+        # Check if event name matches any correction pattern
+        for pattern, correct_date in date_corrections.items():
+            if pattern.lower() in event_name.lower():
+                logger.info(f"Correcting date for '{event_name}': {original_date} -> {correct_date}")
+                return correct_date
+        
+        return original_date
+    
     def _calculate_severity_grade(self, escalation_stage: int, probability: float) -> int:
         """Calculate severity grade (1-5) from escalation stage and probability"""
         # Map escalation stage and probability to severity grade
@@ -1147,7 +1171,7 @@ Be thorough but concise. If information is not available, leave fields as None o
         }
         
         data = {
-            "model": "llama-3.1-sonar-small-128k-online",
+            "model": "sonar-pro",
             "messages": [
                 {"role": "user", "content": query}
             ],
@@ -1423,7 +1447,9 @@ Be thorough but concise. If information is not available, leave fields as None o
         )
         
         # Add additional fields that are not part of the LLM prediction
-        result.event_date = event_details.event_date
+        # Apply date corrections for known misdated events
+        corrected_date = self._correct_event_date(event.get("event_name", ""), event_details.event_date)
+        result.event_date = corrected_date
         result.severity_grade = self._calculate_severity_grade(result.escalation_stage, result.probability)
         
         # Find actual ACCR action (separate from prediction, for output only)
@@ -1665,58 +1691,58 @@ def main():
         severity_grade = result.severity_grade or 0
         
         logger.info(f"\n{i}. {event_date} - {event_name}")
-    logger.info(f"   Severity Grade: {severity_grade}")
-    logger.info(f"   Reason: {result.rationale}")
-    
-    # Display actual action with source indication and detailed historical data
-    actual_action = result.actual_action if result.actual_action else "No documented ACCR action found"
-    
-    # Check for historical ACCR data to show more details
-    company = result.company or "Unknown"
-    historical_displayed = False
-    
-    if company and "qantas" in company.lower():
-        try:
-            event_year = int(event_date[:4]) if len(event_date) >= 4 else None
-            if event_year:
-                year_key = str(event_year)
-                if year_key in accr.accr_historical_data:
-                    year_actions = accr.accr_historical_data[year_key]
-                    resolutions = [a for a in year_actions if a.get("action_type") == "resolution"]
-                    statements = [a for a in year_actions if a.get("action_type") == "statement"]
-                    
-                    if resolutions or statements:
-                        logger.info(f"   Actual ACCR Actions:")
-                        # Show resolutions with voting details
-                        if resolutions:
-                            for res in resolutions:
-                                title = res.get("resolution_title", "")
-                                vote_for = res.get("vote_for_percentage")
-                                if vote_for is not None:
-                                    logger.info(f"     • {res.get('date', '')}: Filed resolution '{title}' - {vote_for}% support")
-                                else:
-                                    logger.info(f"     • {res.get('date', '')}: Filed resolution '{title}'")
-                                significance = res.get("significance")
-                                if significance:
-                                    logger.info(f"       {significance}")
-                        # Show key statements
-                        if statements:
-                            for stmt in statements[:2]:  # Show up to 2 most recent statements
-                                logger.info(f"     • {stmt.get('date', '')}: Issued statement '{stmt.get('title', '')}'")
-                        historical_displayed = True
-        except Exception as e:
-            logger.warning(f"   Error retrieving historical details: {e}")
-    
-    # Fall back to generic display if historical data not shown
-    if not historical_displayed:
-        if actual_action.startswith("Perplexity:"):
-            logger.info(f"   Actual ACCR Action (via Perplexity): {actual_action.replace('Perplexity: ', '')}")
-        elif "Perplexity:" in actual_action:
-            # Combined historical and Perplexity
-            logger.info(f"   Actual ACCR Action: {actual_action}")
-        else:
-            logger.info(f"   Actual ACCR Action: {actual_action}")
-    
+        logger.info(f"   Severity Grade: {severity_grade}")
+        logger.info(f"   Reason: {result.rationale}")
+        
+        # Display actual action with source indication and detailed historical data
+        actual_action = result.actual_action if result.actual_action else "No documented ACCR action found"
+        
+        # Check for historical ACCR data to show more details
+        company = result.company or "Unknown"
+        historical_displayed = False
+        
+        if company and "qantas" in company.lower():
+            try:
+                event_year = int(event_date[:4]) if len(event_date) >= 4 else None
+                if event_year:
+                    year_key = str(event_year)
+                    if year_key in accr.accr_historical_data:
+                        year_actions = accr.accr_historical_data[year_key]
+                        resolutions = [a for a in year_actions if a.get("action_type") == "resolution"]
+                        statements = [a for a in year_actions if a.get("action_type") == "statement"]
+                        
+                        if resolutions or statements:
+                            logger.info(f"   Actual ACCR Actions:")
+                            # Show resolutions with voting details
+                            if resolutions:
+                                for res in resolutions:
+                                    title = res.get("resolution_title", "")
+                                    vote_for = res.get("vote_for_percentage")
+                                    if vote_for is not None:
+                                        logger.info(f"     • {res.get('date', '')}: Filed resolution '{title}' - {vote_for}% support")
+                                    else:
+                                        logger.info(f"     • {res.get('date', '')}: Filed resolution '{title}'")
+                                    significance = res.get("significance")
+                                    if significance:
+                                        logger.info(f"       {significance}")
+                            # Show key statements
+                            if statements:
+                                for stmt in statements[:2]:  # Show up to 2 most recent statements
+                                    logger.info(f"     • {stmt.get('date', '')}: Issued statement '{stmt.get('title', '')}'")
+                            historical_displayed = True
+            except Exception as e:
+                logger.warning(f"   Error retrieving historical details: {e}")
+        
+        # Fall back to generic display if historical data not shown
+        if not historical_displayed:
+            if actual_action.startswith("Perplexity:"):
+                logger.info(f"   Actual ACCR Action (via Perplexity): {actual_action.replace('Perplexity: ', '')}")
+            elif "Perplexity:" in actual_action:
+                # Combined historical and Perplexity
+                logger.info(f"   Actual ACCR Action: {actual_action}")
+            else:
+                logger.info(f"   Actual ACCR Action: {actual_action}")
+        
         logger.info("-" * 80)
     
     logger.info("\n" + "=" * 80)

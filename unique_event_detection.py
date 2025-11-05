@@ -9,6 +9,8 @@ import instructor
 from pydantic import BaseModel, Field
 import numpy as np
 import hashlib
+import requests
+from typing import Optional, List, Dict, Tuple
 
 load_dotenv()
 
@@ -51,6 +53,11 @@ class ComprehensiveEventAnalysis(BaseModel):
 class EventSimilarityCheck(BaseModel):
     is_same_event: bool = Field(..., description="True if this appears to be the same event as the reference event, False if it's a different event")
     similarity_reason: str = Field(..., description="Brief explanation of why these events are considered the same or different")
+
+class PerplexityDateResponse(BaseModel):
+    event_date: str = Field(..., description="The original event date in YYYY-MM-DD format (when the event actually happened, not when it was reported)")
+    confidence: str = Field(..., description="Confidence level: 'high', 'medium', or 'low'")
+    rationale: str = Field(..., description="Brief explanation of the date determination")
 
 def get_embedding(text, model="text-embedding-ada-002"):
     # Clean and validate text
@@ -154,19 +161,26 @@ def final_merge_consecutive_events(events, cache_file='unique_events_cache/simil
                 
             other_event = events[j]
             
-            # Check if events are within 3 months of each other
+            # Check similarity for all events regardless of date difference
             if current_event['event_date'] and other_event['event_date']:
                 current_date = datetime.fromisoformat(current_event['event_date'].replace('Z', ''))
                 other_date = datetime.fromisoformat(other_event['event_date'].replace('Z', ''))
                 days_diff = abs((other_date - current_date).days)
                 
-                if days_diff <= 90:  # 3-month window
-                    # Check embedding similarity
-                    similarity = np.dot(current_event['embedding'], other_event['embedding'])
-                    
-                    if similarity > best_similarity and similarity > 0.4:  # Lower threshold
-                        best_similarity = similarity
-                        best_match_idx = j
+                # Check embedding similarity (no time limit)
+                similarity = np.dot(current_event['embedding'], other_event['embedding'])
+                
+                # Use date difference as a scoring factor (not a filter)
+                # Weight similarity: closer dates get higher weight
+                date_weight = 1.0 - min(days_diff / 365, 0.5)  # Reduce by up to 50% for dates >1 year apart
+                weighted_similarity = similarity * date_weight
+                
+                # For events beyond 1 year apart, require higher similarity threshold (0.7 instead of 0.4)
+                threshold = 0.7 if days_diff > 365 else 0.4
+                
+                if weighted_similarity > best_similarity and similarity > threshold:
+                    best_similarity = weighted_similarity
+                    best_match_idx = j
         
         # If we found a good match, verify with ChatGPT (using cache)
         if best_match_idx is not None:
@@ -218,7 +232,344 @@ def final_merge_consecutive_events(events, cache_file='unique_events_cache/simil
     
     print(f"    Comprehensive merge pass: {len(events)} → {len(merged_events)} events")
     print(f"    Similarity cache performance: {cache_hits} hits, {cache_misses} misses ({cache_hits/(cache_hits+cache_misses)*100:.1f}% hit rate)" if (cache_hits + cache_misses) > 0 else "    No similarity checks performed")
+    
+    # Run cross-temporal deduplication pass
+    merged_events = cross_temporal_deduplication(merged_events)
+    
     return merged_events
+
+def cross_temporal_deduplication(events: List[Dict]) -> List[Dict]:
+    """Dedicated pass for events far apart in time (>90 days) to detect cross-temporal duplicates."""
+    print("    Running cross-temporal deduplication pass...")
+    merged_events = []
+    processed_indices = set()
+    merges = 0
+    
+    for i in range(len(events)):
+        if i in processed_indices:
+            continue
+        
+        current_event = events[i]
+        best_match_idx = None
+        best_similarity = 0.0
+        
+        # Check against all events that are >90 days apart
+        for j in range(i + 1, len(events)):
+            if j in processed_indices:
+                continue
+            
+            other_event = events[j]
+            
+            if current_event['event_date'] and other_event['event_date']:
+                current_date = datetime.fromisoformat(current_event['event_date'].replace('Z', ''))
+                other_date = datetime.fromisoformat(other_event['event_date'].replace('Z', ''))
+                days_diff = abs((other_date - current_date).days)
+                
+                # Only check events >90 days apart
+                if days_diff > 90:
+                    # Check embedding similarity
+                    similarity = np.dot(current_event['embedding'], other_event['embedding'])
+                    
+                    # For distant events, require higher similarity threshold (0.75)
+                    if similarity > 0.75 and similarity > best_similarity:
+                        best_similarity = similarity
+                        best_match_idx = j
+        
+        # If we found a good match, verify with ChatGPT (using cache)
+        if best_match_idx is not None:
+            print(f"    Checking cross-temporal merge (similarity: {best_similarity:.3f}) between events {i} and {best_match_idx}")
+            
+            # Create cache key for this pair
+            cache_key = create_similarity_cache_key(current_event['articles'], events[best_match_idx]['articles'])
+            
+            # Load similarity cache
+            similarity_cache = load_similarity_cache()
+            
+            # Check if we have cached result
+            if cache_key in similarity_cache:
+                cached_result = similarity_cache[cache_key]
+                is_same_event = cached_result.get('is_same_event', False)
+                reason = cached_result.get('reason', '')
+                print(f"    Using cached similarity check: {is_same_event}")
+            else:
+                # Check with ChatGPT using full article texts
+                is_same_event, reason = check_event_similarity_with_chatgpt(
+                    current_event['articles'], 
+                    events[best_match_idx]['articles']
+                )
+                
+                # Cache the result
+                similarity_cache[cache_key] = {
+                    'is_same_event': is_same_event,
+                    'reason': reason
+                }
+                save_similarity_cache(similarity_cache)
+            
+            if is_same_event:
+                print(f"    ChatGPT confirmed cross-temporal merge: {reason}")
+                # Merge events
+                current_event['articles'].extend(events[best_match_idx]['articles'])
+                processed_indices.add(best_match_idx)
+                merges += 1
+        
+        if i not in processed_indices:
+            merged_events.append(current_event)
+    
+    print(f"    Cross-temporal deduplication: {len(events)} → {len(merged_events)} events ({merges} merges)")
+    return merged_events
+
+def _load_perplexity_date_cache(cache_file='unique_events_cache/perplexity_date_cache.json'):
+    """Load Perplexity date query cache."""
+    cache = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+        except Exception as e:
+            print(f"    Warning: Could not load Perplexity date cache: {e}")
+    else:
+        # Create cache directory if it doesn't exist
+        cache_dir = os.path.dirname(cache_file)
+        if cache_dir and not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+    
+    return cache
+
+def _save_perplexity_date_cache(cache: Dict, cache_file='unique_events_cache/perplexity_date_cache.json'):
+    """Save Perplexity date query cache."""
+    try:
+        cache_dir = os.path.dirname(cache_file)
+        if cache_dir and not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+        
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"    Warning: Could not save Perplexity date cache: {e}")
+
+def _query_perplexity_for_event_date(event_name: str, suspected_date: str, full_article_texts: List[str]) -> Optional[PerplexityDateResponse]:
+    """Query Perplexity API for event date verification with full article texts."""
+    perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not perplexity_api_key:
+        print("    Warning: PERPLEXITY_API_KEY not set, skipping date verification")
+        return None
+    
+    # Create cache key
+    cache_key = hashlib.md5(f"{event_name}_{suspected_date}".encode()).hexdigest()
+    
+    # Load cache
+    cache = _load_perplexity_date_cache()
+    
+    # Check cache (entries expire after 30 days)
+    if cache_key in cache:
+        cache_entry = cache[cache_key]
+        cache_timestamp = datetime.fromisoformat(cache_entry.get('timestamp', '2000-01-01'))
+        days_old = (datetime.now() - cache_timestamp).days
+        if days_old < 30:
+            print(f"    Using cached Perplexity date verification for: {event_name}")
+            try:
+                return PerplexityDateResponse(**cache_entry['response'])
+            except Exception as e:
+                print(f"    Warning: Could not parse cached response: {e}")
+    
+    # Prepare full article content
+    article_content = "\n\n---ARTICLE SEPARATOR---\n\n".join(full_article_texts)
+    
+    # Query Perplexity
+    query = f"""When did "{event_name}" originally happen? I need the ORIGINAL EVENT DATE (when the event actually occurred), not the news article publication date. 
+
+The suspected date is {suspected_date}.
+
+Full article content:
+{article_content}
+
+Please respond with JSON in this format:
+{{
+  "event_date": "YYYY-MM-DD",
+  "confidence": "high|medium|low",
+  "rationale": "brief explanation"
+}}"""
+    
+    headers = {
+        "Authorization": f"Bearer {perplexity_api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "model": "sonar-pro",
+        "messages": [
+            {"role": "user", "content": query}
+        ],
+        "max_tokens": 500,
+        "temperature": 0.1
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            response_text = response.json()["choices"][0]["message"]["content"]
+            
+            # Try to parse JSON from response
+            try:
+                # Extract JSON from response (might be wrapped in markdown code blocks)
+                import json as json_lib
+                if "```json" in response_text:
+                    json_start = response_text.find("```json") + 7
+                    json_end = response_text.find("```", json_start)
+                    response_text = response_text[json_start:json_end].strip()
+                elif "```" in response_text:
+                    json_start = response_text.find("```") + 3
+                    json_end = response_text.find("```", json_start)
+                    response_text = response_text[json_start:json_end].strip()
+                
+                response_dict = json_lib.loads(response_text)
+                result = PerplexityDateResponse(**response_dict)
+                
+                # Cache the result
+                cache[cache_key] = {
+                    "query": query,
+                    "response": response_dict,
+                    "timestamp": datetime.now().isoformat()
+                }
+                _save_perplexity_date_cache(cache)
+                
+                return result
+            except Exception as e:
+                print(f"    Warning: Could not parse Perplexity JSON response: {e}")
+                print(f"    Response text: {response_text[:200]}")
+                return None
+        else:
+            print(f"    Warning: Perplexity API error {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        print(f"    Warning: Perplexity API request failed: {e}")
+        return None
+
+def verify_event_date_with_perplexity(event_name: str, extracted_date: str, articles: List[Dict]) -> Optional[str]:
+    """Verify event date using Perplexity with full article texts."""
+    # Extract full article texts (not truncated)
+    full_article_texts = []
+    for article in articles:
+        if article.get('full_content'):
+            full_article_texts.append(article['full_content'])
+        elif article.get('title'):
+            full_article_texts.append(article.get('title', ''))
+    
+    if not full_article_texts:
+        return None
+    
+    # Query Perplexity
+    result = _query_perplexity_for_event_date(event_name, extracted_date, full_article_texts)
+    
+    if result and result.confidence in ['high', 'medium']:
+        if result.event_date != extracted_date:
+            print(f"    Perplexity suggests different date: {extracted_date} -> {result.event_date} (confidence: {result.confidence}, rationale: {result.rationale})")
+            return result.event_date
+    
+    return None
+
+def validate_extracted_date(event_date: str, article_dates: List[str], event_name: str, full_article_texts: List[str]) -> Tuple[str, bool]:
+    """Validate extracted date and flag suspicious dates for Perplexity verification.
+    Expanded rules to catch more potential date issues."""
+    if not event_date:
+        return event_date, False
+    
+    # Check if extracted date is suspiciously close to article publication dates
+    try:
+        event_date_obj = datetime.fromisoformat(event_date.replace('Z', ''))
+        article_date_objs = []
+        
+        if article_dates:
+            article_date_objs = [datetime.fromisoformat(d.replace('Z', '')) for d in article_dates if d]
+        
+        # Expanded verification rules - be more permissive
+        if article_date_objs:
+            # Check if extracted date differs significantly from article dates
+            date_diffs = [abs((event_date_obj - d).days) for d in article_date_objs]
+            max_diff = max(date_diffs) if date_diffs else 0
+            min_diff = min(date_diffs) if date_diffs else 0
+            
+            # Flag if date difference is large (more than 6 months) - might indicate confusion
+            if max_diff > 180:
+                return event_date, True  # Flag for verification
+            
+            # Flag if date is very close to article dates (within 7 days) - might be publication date confusion
+            if min_diff <= 7:
+                article_text = " ".join(full_article_texts).lower()
+                # Check for temporal references suggesting older event
+                temporal_keywords = ['recalling', 'anniversary', 'years ago', 'previously', 'in 20', 'decade', 'earlier', 'past', 'remembering']
+                if any(keyword in article_text for keyword in temporal_keywords):
+                    return event_date, True  # Flag for verification
+            
+            # Flag if articles are from recent date but event name suggests historical event
+            min_article_date = min(article_date_objs)
+            if min_article_date.year >= 2024 and event_date_obj.year >= 2024:
+                article_text = " ".join(full_article_texts).lower()
+                # Check for temporal references suggesting older event
+                temporal_keywords = ['in 20', 'years ago', 'previously', 'recalling', 'anniversary', 'decade', 'earlier', 'past']
+                if any(keyword in article_text for keyword in temporal_keywords):
+                    # Event name might suggest historical event
+                    historical_keywords = ['grounding', 'strike', 'fine', 'scandal', 'incident', 'accident', 'crash', 'dispute', 'controversy']
+                    if any(keyword in event_name.lower() for keyword in historical_keywords):
+                        return event_date, True  # Flag for verification
+            
+            # Flag if date difference is moderate (30-180 days) and article text suggests date confusion
+            if 30 <= max_diff <= 180:
+                article_text = " ".join(full_article_texts).lower()
+                if any(keyword in article_text for keyword in ['recalling', 'anniversary', 'previously', 'years ago']):
+                    return event_date, True  # Flag for verification
+    except Exception as e:
+        print(f"    Warning: Error validating date: {e}")
+        return event_date, False
+    
+    return event_date, False
+
+def correct_event_dates(events: List[Dict]) -> List[Dict]:
+    """Post-process events to correct dates using Perplexity verification."""
+    print("    Correcting event dates using Perplexity verification...")
+    corrections = 0
+    
+    for event in events:
+        event_name = event.get('event_name', '')
+        event_date = event.get('event_date')
+        articles = event.get('articles', [])
+        
+        if not event_date or not articles:
+            continue
+        
+        # Get article dates
+        article_dates = []
+        full_article_texts = []
+        for article in articles:
+            if article.get('publication_date'):
+                article_dates.append(article['publication_date'])
+            if article.get('full_content'):
+                full_article_texts.append(article['full_content'])
+            elif article.get('title'):
+                full_article_texts.append(article.get('title', ''))
+        
+        # Validate date
+        validated_date, needs_verification = validate_extracted_date(
+            event_date, article_dates, event_name, full_article_texts
+        )
+        
+        if needs_verification:
+            # Query Perplexity
+            corrected_date = verify_event_date_with_perplexity(event_name, validated_date, articles)
+            
+            if corrected_date and corrected_date != event_date:
+                print(f"    Corrected date for '{event_name}': {event_date} -> {corrected_date}")
+                event['event_date'] = corrected_date
+                corrections += 1
+    
+    print(f"    Corrected {corrections} dates using Perplexity")
+    return events
 
 def create_similarity_cache_key(articles1, articles2):
     """Create a unique cache key for a pair of article sets."""
@@ -246,25 +597,30 @@ def check_event_similarity_with_chatgpt(event1_articles, event2_articles, max_re
     if not event1_articles or not event2_articles:
         return False, "No articles to compare"
     
-    # Prepare text content for both events
+    # Prepare text content for both events - send FULL article texts (not truncated)
     def prepare_event_text(articles):
         content_parts = []
         for article in articles:
             if article.get('full_content'):
-                content = article['full_content'][:1000]  # Limit each article
-                content_parts.append(content)
+                # Include full content (not truncated)
+                content_parts.append(article['full_content'])
             elif article.get('title'):
                 content_parts.append(article['title'])
-        return "\n\n---\n\n".join(content_parts)
+        return "\n\n---ARTICLE SEPARATOR---\n\n".join(content_parts)
     
     event1_text = prepare_event_text(event1_articles)
     event2_text = prepare_event_text(event2_articles)
     
-    # Limit text length
-    if len(event1_text) > 4000:
-        event1_text = event1_text[:4000] + "\n\n[Content truncated]"
-    if len(event2_text) > 4000:
-        event2_text = event2_text[:4000] + "\n\n[Content truncated]"
+    # Get event dates for context
+    event1_date = None
+    event2_date = None
+    if event1_articles:
+        # Try to get date from first article's ai_analysis
+        if event1_articles[0].get('ai_analysis', {}).get('event_date'):
+            event1_date = event1_articles[0]['ai_analysis']['event_date']
+    if event2_articles:
+        if event2_articles[0].get('ai_analysis', {}).get('event_date'):
+            event2_date = event2_articles[0]['ai_analysis']['event_date']
     
     def call_chatgpt_with_retry(prompt_type, messages, response_model):
         """Helper function to call ChatGPT with retry logic"""
@@ -285,6 +641,10 @@ def check_event_similarity_with_chatgpt(event1_articles, event2_articles, max_re
                     return None
     
     try:
+        date_info = ""
+        if event1_date and event2_date:
+            date_info = f"\n\nEvent 1 date: {event1_date}\nEvent 2 date: {event2_date}\n"
+        
         similarity_messages = [
             {"role": "system", "content": """You are a helpful assistant that determines if two news events are the same event. Consider these factors:
 
@@ -294,17 +654,22 @@ def check_event_similarity_with_chatgpt(event1_articles, event2_articles, max_re
 4. **Same organizations/people**: Do they involve the same companies, people, or entities?
 5. **Same type of event**: Are they the same category (e.g., both about outsourcing, both about safety, both about financial results)?
 
+**IMPORTANT - Cross-temporal events**: If events are years apart but describe the same incident (e.g., a 2011 event vs a 2024 article about that 2011 event), they should be merged. For example:
+- A 2011 Qantas fleet grounding event and a 2024 article mentioning "the 2011 Qantas fleet grounding" → SAME EVENT
+- A 2019 fine and a 2024 article recalling "the 2019 fine" → SAME EVENT
+
 Examples of SAME events:
 - "Qantas fined $59M for illegal outsourcing" and "Airline faces $90M outsourcing penalty" (same legal case)
 - "Qantas workers strike" and "Qantas union industrial action continues" (same strike)
 - "Qantas flight delayed" and "Qantas flight cancellation" (same flight incident)
+- A 2011 event and a 2024 article about that 2011 event (same historical incident)
 
 Examples of DIFFERENT events:
 - "Qantas fined for outsourcing" and "Qantas fined for safety violation" (different cases)
 - "Qantas strike in Sydney" and "Qantas strike in Melbourne" (different locations)
 
 Be thorough but not overly conservative - if they're clearly the same event with different wording, mark them as the same."""},
-            {"role": "user", "content": f"Are these two events the same event?\n\nEvent 1:\n{event1_text}\n\nEvent 2:\n{event2_text}\n\nConsider if they describe the same incident, legal case, ongoing situation, or specific event."}
+            {"role": "user", "content": f"Are these two events the same event?{date_info}\n\nEvent 1:\n{event1_text}\n\nEvent 2:\n{event2_text}\n\nConsider if they describe the same incident, legal case, ongoing situation, or specific event. Pay special attention if events are years apart - they may still be the same event if one is a retrospective article about the other."}
         ]
         
         similarity_response = call_chatgpt_with_retry("event similarity", similarity_messages, EventSimilarityCheck)
@@ -571,13 +936,12 @@ def get_event_details_from_chatgpt(articles, max_retries=3, cache_file='unique_e
             cached_result.get('response_strategies')
         )
 
-    # Prepare text content, handling edge cases
+    # Prepare text content - send FULL article texts (not truncated)
     content_parts = []
     for article in articles:
         if article.get('full_content'):
-            # Truncate very long content to avoid token limits
-            content = article['full_content'][:2000]  # Limit each article to 2000 chars
-            content_parts.append(content)
+            # Include full content (not truncated)
+            content_parts.append(article['full_content'])
         elif article.get('title'):
             content_parts.append(article['title'])
     
@@ -585,11 +949,10 @@ def get_event_details_from_chatgpt(articles, max_retries=3, cache_file='unique_e
         print("    Warning: No content available for ChatGPT analysis")
         return None, None, None
     
-    text = "\n\n---\n\n".join(content_parts)
+    text = "\n\n---ARTICLE SEPARATOR---\n\n".join(content_parts)
     
-    # Limit total text length to avoid token limits
-    if len(text) > 8000:
-        text = text[:8000] + "\n\n[Content truncated due to length]"
+    # Note: We send full content, but if it's extremely long, we may need to handle it
+    # For now, send full content and let the API handle token limits
 
     def call_chatgpt_with_retry(prompt_type, messages, response_model):
         """Helper function to call ChatGPT with retry logic"""
@@ -618,7 +981,13 @@ def get_event_details_from_chatgpt(articles, max_retries=3, cache_file='unique_e
         comprehensive_messages = [
             {"role": "system", "content": """You are a helpful assistant that performs comprehensive analysis of news events. Analyze the provided articles and return detailed information about the event including:
 
-1. Event date in YYYY-MM-DD format
+1. **Event date in YYYY-MM-DD format** - CRITICAL: Extract the ORIGINAL EVENT DATE (when the event actually happened), NOT the news article publication date or reporting date. For retrospective articles (e.g., articles from 2024 mentioning a 2011 event), extract the historical event date (when the event originally occurred), not when the article was written or published. Look for temporal references like "in 2011", "during October 2011", "recalling", "anniversary of", "occurred on", "happened on", "issued on", "announced on".
+
+Examples:
+- Article from 2024-08-08 mentioning 'the 2011 Qantas fleet grounding' → extract 2011-10-29 (the original event date, not 2024-08-08)
+- Article from 2024 discussing 'recalling the incident that occurred in 2019' → extract 2019 date (the original event date, not 2024)
+- Article published on 2024-08-08 about a fine issued on 2023-06-15 → extract 2023-06-15 (the original event date)
+
 2. Short descriptive event name (3-8 words)
 3. Sentiment score (-1.0 to 1.0)
 4. Event categories (labour, safety, customer_service, financial, legal, environmental, technology, management, competition, regulatory, operational, reputation, acquisitions, partnerships, awards, expansion, restructuring, innovation, crisis, compliance)
@@ -690,6 +1059,57 @@ Be thorough and accurate in your analysis, especially in identifying executive r
         print(f"    Unexpected error in ChatGPT processing: {e}")
         return None, "Unnamed Event", 0.0, [], False, "Unknown", [], []
 
+
+def filter_qantas_events(events: List[Dict]) -> List[Dict]:
+    """Filter events to only include those related to Qantas."""
+    qantas_events = []
+    
+    print("    Filtering events to only include Qantas-related events...")
+    
+    for event in events:
+        event_name = event.get('event_name', '').lower()
+        primary_entity = event.get('primary_entity', '').lower()
+        
+        # Check if event is Qantas-related
+        is_qantas_related = (
+            'qantas' in event_name or
+            'qantas' in primary_entity or
+            primary_entity == 'qantas' or
+            event.get('is_qantas_reputation_damage_event', False)
+        )
+        
+        # Also check article content for Qantas mentions
+        if not is_qantas_related:
+            for article in event.get('articles', []):
+                article_title = article.get('title', '').lower()
+                article_content = article.get('full_content', '').lower()
+                if 'qantas' in article_title or 'qantas' in article_content:
+                    is_qantas_related = True
+                    break
+        
+        # Additional filters to exclude clearly non-Qantas events
+        non_qantas_keywords = [
+            'ticketmaster',
+            'taylor swift',
+            'nevada state government',
+            'cyberattack',
+            'government',
+            'state',
+            'federal'
+        ]
+        
+        # Check if event contains non-Qantas keywords (but allow if Qantas is also mentioned)
+        contains_non_qantas = any(keyword in event_name for keyword in non_qantas_keywords)
+        if contains_non_qantas and 'qantas' not in event_name and 'qantas' not in primary_entity:
+            is_qantas_related = False
+        
+        if is_qantas_related:
+            qantas_events.append(event)
+        else:
+            print(f"    Filtered out non-Qantas event: {event.get('event_name', 'Unknown')} (primary_entity: {event.get('primary_entity', 'Unknown')})")
+    
+    print(f"    Filtered {len(events)} events → {len(qantas_events)} Qantas-related events")
+    return qantas_events
 
 def calculate_event_statistics(events):
     """Calculate statistics for each event."""
@@ -797,6 +1217,17 @@ def main():
     events = group_articles_into_events(articles)
     
     print(f"✓ Detected {len(events)} unique events.")
+    print("-" * 40)
+    
+    print("Step 2.5: Correcting event dates using Perplexity verification...")
+    events = correct_event_dates(events)
+    
+    print("-" * 40)
+    
+    print("Step 2.6: Filtering events to only include Qantas-related events...")
+    events = filter_qantas_events(events)
+    
+    print(f"✓ {len(events)} Qantas-related events after filtering.")
     print("-" * 40)
     
     print("Step 3: Calculating event statistics and getting details from ChatGPT...")

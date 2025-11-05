@@ -119,7 +119,19 @@ python fetch_share_price.py
 - Identifies significant price drops
 - Saves as `qantas_share_price_data.json`
 
-### **Step 4: Generate Interactive Dashboard**
+### **Step 4: Predict ACCR Stakeholder Severity**
+```bash
+python accr_severity_predictor.py
+```
+
+**What this does:**
+- Loads unique shareholder events from Step 2
+- Predicts ACCR (Australasian Centre for Corporate Responsibility) response severity
+- Includes historical ACCR engagement context and recent shareholder events
+- Generates severity grades (1-5) for dashboard visualization
+- Saves results to `accr_severity_results.json`
+
+### **Step 5: Generate Interactive Dashboard**
 ```bash
 python generate_dashboard.py
 ```
@@ -131,7 +143,7 @@ python generate_dashboard.py
 - Creates interactive HTML dashboard with timeline axis bound at Aug 2020
 - Generates `dashboards/qantas_reputation_dashboard.html`
 
-### **Step 5: View Results**
+### **Step 6: View Results**
 Open `dashboards/qantas_reputation_dashboard.html` in your web browser to explore the interactive analysis.
 
 ## 🗂 Project Structure
@@ -141,6 +153,7 @@ qantas-reputation-management/
 ├── qantas_reputation_scraper.py    # Main scraper with AI analysis
 ├── unique_event_detection.py       # Unique event detection with caching
 ├── fetch_share_price.py            # Stock price data fetcher
+├── accr_severity_predictor.py      # ACCR severity prediction model
 ├── generate_dashboard.py           # Interactive dashboard generator
 ├── qantas_news_analyzer.py         # Standalone analysis tool (optional)
 ├── requirements.txt                 # Python dependencies
@@ -158,6 +171,7 @@ qantas-reputation-management/
 │   └── deduplication_cache.json   # Final merged events
 ├── unique_events_output/           # Unique events data
 │   └── unique_events_chatgpt_v2.json
+├── accr_severity_results.json      # ACCR severity predictions
 └── dashboards/                     # Generated dashboards
     └── qantas_reputation_dashboard.html
 ```

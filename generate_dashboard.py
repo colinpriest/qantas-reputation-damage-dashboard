@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 import statistics
+from collections import defaultdict
 
 class DashboardGenerator:
     def __init__(self):
@@ -15,6 +16,7 @@ class DashboardGenerator:
         self.share_price_file = 'qantas_share_price_data.json'
         self.activism_file = 'shareholder_activism_results.json'
         self.share_price_drops_file = 'qantas_share_price_drops.csv'
+        self.accr_results_file = 'accr_severity_results.json'
 
         # Create dashboards directory if it doesn't exist
         self.dashboards_dir = 'dashboards'
@@ -183,18 +185,9 @@ class DashboardGenerator:
             "high_severity_events": []
         }
         
-        # Identify high severity events (score >= 4)
-        for event in reputation_events:
-            if event.get('mean_damage_score', 0) >= 4:
-                # Filter out 'reputation' category from displayed categories
-                filtered_categories = [cat for cat in event.get('event_categories', []) if cat.lower() != 'reputation']
-                summary["high_severity_events"].append({
-                    "title": event.get('event_name', 'Unnamed Event'),
-                    "date": event.get('event_date', ''),
-                    "damage_score": event.get('mean_damage_score', 0),
-                    "categories": filtered_categories,
-                    "key_facts": f"Primary entity: {event.get('primary_entity', 'Unknown')}. {event.get('num_articles', 0)} articles covering this event."
-                })
+        # Note: High severity events will be determined from ACCR results instead
+        # This list is kept empty here and will be populated from ACCR results
+        summary["high_severity_events"] = []
         
         print(f"Generated summary: {len(reputation_events)} reputation events from {total_events} total events")
         return summary
@@ -360,6 +353,111 @@ class DashboardGenerator:
             'second_strike': second_strikes
         }
 
+    def load_accr_results(self) -> Dict:
+        """
+        Load ACCR severity prediction results from JSON file.
+        
+        Returns:
+            Dictionary with metadata, results list, and top_5_most_severe
+            Returns empty dict with default structure if file not found
+        """
+        if os.path.exists(self.accr_results_file):
+            try:
+                print(f"Loading ACCR results from {self.accr_results_file}...")
+                with open(self.accr_results_file, 'r', encoding='utf-8') as f:
+                    accr_data = json.load(f)
+                print(f"Loaded ACCR results: {len(accr_data.get('results', []))} events")
+                return accr_data
+            except json.JSONDecodeError as e:
+                print(f"Warning: Invalid JSON in {self.accr_results_file}: {e}")
+                return {'metadata': {}, 'results': [], 'top_5_most_severe': []}
+            except Exception as e:
+                print(f"Warning: Error loading ACCR results: {e}")
+                return {'metadata': {}, 'results': [], 'top_5_most_severe': []}
+        else:
+            print(f"Warning: ACCR results file not found at {self.accr_results_file}")
+            print("Please run accr_severity_predictor.py first to generate ACCR predictions.")
+            return {'metadata': {}, 'results': [], 'top_5_most_severe': []}
+    
+    def prepare_accr_timeline_data(self, accr_results: Dict, unique_events: List[Dict] = None) -> List[Dict]:
+        """
+        Prepare ACCR severity data for timeline chart visualization.
+        Filters to only include Qantas-related events.
+        
+        Args:
+            accr_results: Dictionary containing ACCR results from load_accr_results()
+            unique_events: Optional list of unique events to match for Qantas filtering
+            
+        Returns:
+            List of dictionaries with format: {x: date, y: severity_grade, label: event_name}
+        """
+        timeline_data = []
+        
+        results = accr_results.get('results', [])
+        if not results:
+            return timeline_data
+        
+        # Create a mapping of event names to unique events for Qantas filtering
+        events_dict = {}
+        if unique_events:
+            events_dict = {e.get('event_name', ''): e for e in unique_events}
+        
+        for result in results:
+            event_date = result.get('event_date', '')
+            severity_grade = result.get('severity_grade')
+            event_name = result.get('event_name', 'Unknown Event')
+            company = result.get('company', '')
+            
+            # Filter out non-Qantas events
+            is_qantas_related = False
+            
+            # Check company field
+            if company and 'qantas' in company.lower():
+                is_qantas_related = True
+            
+            # Check event name
+            if not is_qantas_related and 'qantas' in event_name.lower():
+                is_qantas_related = True
+            
+            # Check against unique events data if available
+            if not is_qantas_related and events_dict:
+                event_details = events_dict.get(event_name, {})
+                primary_entity = event_details.get('primary_entity', '').lower()
+                if 'qantas' in primary_entity:
+                    is_qantas_related = True
+            
+            # Exclude non-Qantas events
+            if not is_qantas_related:
+                # Check for non-Qantas keywords
+                non_qantas_keywords = ['ticketmaster', 'taylor swift', 'nevada state government']
+                if any(keyword in event_name.lower() for keyword in non_qantas_keywords):
+                    continue  # Skip this event
+            
+            # Only include events with valid dates and severity grades
+            if event_date and severity_grade is not None and is_qantas_related:
+                # Format date for Chart.js (YYYY-MM-DD)
+                try:
+                    # Ensure date is in YYYY-MM-DD format
+                    if len(event_date) >= 10:
+                        date_str = event_date[:10]  # Take first 10 characters (YYYY-MM-DD)
+                    else:
+                        continue  # Skip invalid dates
+                    
+                    timeline_data.append({
+                        'x': date_str,
+                        'y': severity_grade,
+                        'event_name': event_name,
+                        'rationale': result.get('rationale', ''),
+                        'actual_action': result.get('actual_action', '')
+                    })
+                except Exception as e:
+                    print(f"Warning: Skipping event {event_name} due to date parsing error: {e}")
+                    continue
+        
+        # Sort by date
+        timeline_data.sort(key=lambda x: x['x'])
+        return timeline_data
+    
     def load_share_price_drops_data(self) -> Dict:
         """Load and prepare share price drops data for quarterly chart"""
         if not os.path.exists(self.share_price_drops_file):
@@ -389,6 +487,87 @@ class DashboardGenerator:
         return {
             'quarters': quarter_counts['quarter_label'].tolist(),
             'counts': quarter_counts['count'].tolist()
+        }
+    
+    def prepare_share_drop_category_data(self) -> Dict:
+        """
+        Prepare data for share price drop category radar charts.
+        Reuses logic from significant_share_price_drops.py create_radar_plots().
+        
+        Returns:
+            Dictionary with categories, event counts, and average drop magnitudes
+        """
+        if not os.path.exists(self.share_price_drops_file):
+            print(f"Warning: Share price drops file not found at {self.share_price_drops_file}")
+            return {
+                'categories': [],
+                'event_counts': [],
+                'avg_drops': []
+            }
+        
+        print(f"Loading share price drops category data from {self.share_price_drops_file}...")
+        
+        import pandas as pd
+        df = pd.read_csv(self.share_price_drops_file)
+        
+        # Convert to list of dicts for processing (matching create_radar_plots format)
+        results = df.to_dict('records')
+        
+        # Parse categories from results (reusing create_radar_plots logic)
+        category_counts = defaultdict(int)
+        category_avg_drops = defaultdict(list)
+        
+        for result in results:
+            categories_str = result.get('categories', '')
+            
+            # Handle NaN/float values from pandas (convert to empty string)
+            if not isinstance(categories_str, str):
+                if pd.isna(categories_str):
+                    categories_str = ''
+                else:
+                    categories_str = str(categories_str)
+            
+            if not categories_str or categories_str == 'None':
+                continue
+            
+            # Split multiple categories (separated by semicolons)
+            categories = [cat.strip() for cat in categories_str.split(';') if cat.strip()]
+            
+            # Filter out invalid categories
+            categories = [cat for cat in categories
+                         if cat and cat.lower() not in ['no applicable categories', 'none', 'no applicable categories.']]
+            
+            drop_magnitude = abs(result.get('qantas_drop_percent', 0))
+            
+            for category in categories:
+                category_counts[category] += 1
+                category_avg_drops[category].append(drop_magnitude)
+        
+        # Calculate average drops
+        category_avg = {cat: sum(drops) / len(drops) if drops else 0 
+                       for cat, drops in category_avg_drops.items()}
+        
+        # Sort categories alphabetically for consistent ordering
+        # Filter out invalid categories
+        all_categories = sorted([cat for cat in set(category_counts.keys())
+                                if cat and cat.lower() not in ['no applicable categories', 'none', '']])
+        
+        if not all_categories:
+            print("\n[WARNING] No categories found for share drop charts")
+            return {
+                'categories': [],
+                'event_counts': [],
+                'avg_drops': []
+            }
+        
+        # Prepare data for radar charts
+        counts = [category_counts[cat] for cat in all_categories]
+        avgs = [category_avg[cat] for cat in all_categories]
+        
+        return {
+            'categories': all_categories,
+            'event_counts': counts,
+            'avg_drops': avgs
         }
     
     def prepare_timeline_data(self, events: List[Dict], share_data: Dict) -> str:
@@ -472,16 +651,84 @@ class DashboardGenerator:
             'reputation_events': enriched_events
         }
     
-    def generate_html(self, events_data: Dict, share_data: Dict, activism_data: List[Dict], share_price_drops_data: Dict) -> str:
+    def generate_html(self, events_data: Dict, share_data: Dict, activism_data: List[Dict], share_price_drops_data: Dict, accr_results: Dict = None, share_drop_category_data: Dict = None) -> str:
         """Generate the HTML dashboard"""
 
         timeline_data = self.prepare_timeline_data(events_data['events'], share_data)
         summary = events_data.get('summary', {})
-        high_impact_events = summary.get("high_severity_events", [])
+        
+        # Prepare high impact events from ACCR results (top 6 most severe, Qantas events only)
+        high_impact_events = []
+        if accr_results:
+            results = accr_results.get('results', [])
+            if results:
+                # Match with unique events data to get additional details and filter Qantas events
+                events_dict = {e.get('event_name', ''): e for e in events_data.get('events', [])}
+                
+                # Filter to only Qantas-related events
+                qantas_accr_results = []
+                for accr_result in results:
+                    event_name = accr_result.get('event_name', 'Unknown Event')
+                    company = accr_result.get('company', '')
+                    
+                    # Check if Qantas-related
+                    is_qantas_related = False
+                    
+                    # Check company field
+                    if company and 'qantas' in company.lower():
+                        is_qantas_related = True
+                    
+                    # Check event name
+                    if not is_qantas_related and 'qantas' in event_name.lower():
+                        is_qantas_related = True
+                    
+                    # Check against unique events data
+                    if not is_qantas_related:
+                        event_details = events_dict.get(event_name, {})
+                        primary_entity = event_details.get('primary_entity', '').lower()
+                        if 'qantas' in primary_entity:
+                            is_qantas_related = True
+                    
+                    # Exclude non-Qantas events
+                    if not is_qantas_related:
+                        non_qantas_keywords = ['ticketmaster', 'taylor swift', 'nevada state government']
+                        if any(keyword in event_name.lower() for keyword in non_qantas_keywords):
+                            continue  # Skip this event
+                    
+                    if is_qantas_related:
+                        qantas_accr_results.append(accr_result)
+                
+                # Sort by severity grade descending and take top 6
+                sorted_results = sorted(qantas_accr_results, key=lambda x: x.get('severity_grade', 0), reverse=True)
+                top_6_events = sorted_results[:6]
+                
+                for accr_result in top_6_events:
+                    event_name = accr_result.get('event_name', 'Unknown Event')
+                    event_date = accr_result.get('event_date', '')
+                    severity_grade = accr_result.get('severity_grade', 0)
+                    rationale = accr_result.get('rationale', '')
+                    actual_action = accr_result.get('actual_action', '')
+                    
+                    # Get event details from unique events if available
+                    event_details = events_dict.get(event_name, {})
+                    filtered_categories = [cat for cat in event_details.get('event_categories', []) if cat.lower() != 'reputation']
+                    
+                    high_impact_events.append({
+                        "title": event_name,
+                        "date": event_date,
+                        "severity_grade": severity_grade,
+                        "categories": filtered_categories,
+                        "key_facts": f"Primary entity: {event_details.get('primary_entity', 'Unknown')}. {event_details.get('num_articles', 0)} articles covering this event. {rationale}",
+                        "rationale": rationale,
+                        "actual_action": actual_action
+                    })
 
         # Prepare activism charts data
         agm_remuneration_data = self.prepare_agm_remuneration_data(activism_data)
         protest_votes_data = self.prepare_protest_votes_data(activism_data)
+        
+        # Prepare ACCR timeline data (filtered to Qantas events only)
+        accr_timeline_data = self.prepare_accr_timeline_data(accr_results, events_data.get('events', [])) if accr_results else []
         
         # The core HTML structure, a basic template.
         html_template = '''<!DOCTYPE html>
@@ -529,6 +776,11 @@ class DashboardGenerator:
             </div>
         </div>
         <div class="chart-container"><h2 class="section-title"><i class="fas fa-chart-line"></i> Share Price & Reputation Events Timeline</h2><canvas id="mainTimeline" height="100"></canvas></div>
+        <div class="chart-container"><h2 class="section-title"><i class="fas fa-user-shield"></i> ACCR Predicted Severity for Shareholder Events</h2><canvas id="accrTimeline" height="100"></canvas><p class="text-muted small mt-2">Timeline of ACCR predicted severity grades (1-5) for shareholder events. Higher severity indicates greater likelihood of ACCR activism.</p></div>
+        <div class="row">
+            <div class="col-md-6"><div class="chart-container"><h3 class="section-title"><i class="fas fa-chart-pie"></i> Number of Share Price Drop Events by Category</h3><canvas id="shareDropEventsChart" height="200"></canvas></div></div>
+            <div class="col-md-6"><div class="chart-container"><h3 class="section-title"><i class="fas fa-percent"></i> Average Share Price Drop Magnitude by Category (%)</h3><canvas id="avgShareDropChart" height="200"></canvas></div></div>
+        </div>
         <div class="row">
             <div class="col-md-6"><div class="chart-container"><h3 class="section-title"><i class="fas fa-tags"></i> Event Categories</h3><canvas id="categoryChart"></canvas></div></div>
             <div class="col-md-6"><div class="chart-container"><h3 class="section-title"><i class="fas fa-users"></i> Affected Stakeholders</h3><canvas id="stakeholderChart"></canvas></div></div>
@@ -537,7 +789,7 @@ class DashboardGenerator:
             <div class="col-md-6"><div class="chart-container"><h3 class="section-title"><i class="fas fa-exclamation-triangle"></i> Event Severity Distribution</h3><canvas id="severityChart" height="120"></canvas></div></div>
             <div class="col-md-6"><div class="chart-container"><h3 class="section-title"><i class="fas fa-shield-alt"></i> Response Strategies</h3><canvas id="responseChart" height="120"></canvas></div></div>
         </div>
-        <div class="chart-container"><h3 class="section-title"><i class="fas fa-fire"></i> High Impact Events (Damage Score ≥ 4)</h3><div id="highImpactEvents" class="row"></div></div>
+        <div class="chart-container"><h3 class="section-title"><i class="fas fa-fire"></i> Top 6 Most Severe Events (ACCR Perspective)</h3><div id="highImpactEvents" class="row"></div></div>
         <div class="chart-container">
             <h3 class="section-title"><i class="fas fa-timeline"></i> Stakeholder Reputation Trajectories (Delta)</h3>
             <canvas id="stakeholderTrajectory" height="110"></canvas>
@@ -629,6 +881,8 @@ class DashboardGenerator:
         const highImpactEventsData = HIGH_IMPACT_EVENTS_PLACEHOLDER || [];
         const allEvents = REPUTATION_EVENTS_PLACEHOLDER || [];
         const reactionsData = REACTIONS_PLACEHOLDER || {stakeholders: [], events: []};
+        const accrTimelineData = ACCR_TIMELINE_DATA_PLACEHOLDER || [];
+        const shareDropCategoryData = SHARE_DROP_CATEGORY_DATA_PLACEHOLDER || {categories: [], event_counts: [], avg_drops: []};
 
         // Main Timeline Chart
         const ctx1 = document.getElementById('mainTimeline').getContext('2d');
@@ -709,6 +963,233 @@ class DashboardGenerator:
                 }
             }
         });
+        
+        // ACCR Severity Timeline Chart
+        const ctxAccr = document.getElementById('accrTimeline').getContext('2d');
+        const accrDataPoints = accrTimelineData.map(d => ({x: d.x, y: d.y, event_name: d.event_name, rationale: d.rationale}));
+        
+        // Color coding by severity grade
+        const getSeverityColor = (grade) => {
+            if (grade <= 2) return '#4CAF50'; // Green for low severity
+            if (grade === 3) return '#FFC107'; // Yellow for medium severity
+            if (grade === 4) return '#FF9800'; // Orange for high severity
+            return '#F44336'; // Red for severe
+        };
+        
+        new Chart(ctxAccr, {
+            type: 'scatter',
+            data: {
+                datasets: [{
+                    label: 'ACCR Predicted Severity',
+                    data: accrDataPoints,
+                    backgroundColor: accrDataPoints.map(d => getSeverityColor(d.y)),
+                    borderColor: accrDataPoints.map(d => getSeverityColor(d.y)),
+                    pointRadius: 6,
+                    pointHoverRadius: 8,
+                }]
+            },
+            options: {
+                responsive: true,
+                interaction: {
+                    mode: 'index',
+                    intersect: false
+                },
+                plugins: {
+                    tooltip: {
+                        bodyFont: {
+                            size: 11
+                        },
+                        padding: 12,
+                        titleFont: {
+                            size: 13,
+                            weight: 'bold'
+                        },
+                        titleSpacing: 8,
+                        bodySpacing: 6,
+                        displayColors: false,
+                        callbacks: {
+                            title: function(context) {
+                                const point = accrDataPoints[context[0].dataIndex];
+                                return point.event_name || 'Event';
+                            },
+                            label: function(context) {
+                                const point = accrDataPoints[context.dataIndex];
+                                
+                                // Format date to DD-MMM-YYYY
+                                const formatDate = (dateStr) => {
+                                    try {
+                                        const date = new Date(dateStr);
+                                        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                                                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                                        const day = String(date.getDate()).padStart(2, '0');
+                                        const month = months[date.getMonth()];
+                                        const year = date.getFullYear();
+                                        return `${day}-${month}-${year}`;
+                                    } catch (e) {
+                                        return dateStr;
+                                    }
+                                };
+                                
+                                const formattedDate = formatDate(context.parsed.x);
+                                
+                                // Split rationale into multiple lines if needed (word wrap at ~60 chars)
+                                const rationale = (point.rationale || 'N/A');
+                                const maxLineLength = 60;
+                                let formattedRationale = '';
+                                let currentLine = '';
+                                
+                                const words = rationale.split(' ');
+                                for (const word of words) {
+                                    if ((currentLine + word).length > maxLineLength && currentLine.length > 0) {
+                                        formattedRationale += currentLine.trim() + '\\n';
+                                        currentLine = word + ' ';
+                                    } else {
+                                        currentLine += word + ' ';
+                                    }
+                                }
+                                formattedRationale += currentLine.trim();
+                                
+                                return [
+                                    'Date: ' + formattedDate,
+                                    'Severity Grade: ' + context.parsed.y,
+                                    '',
+                                    'Rationale:',
+                                    formattedRationale
+                                ];
+                            }
+                        }
+                    },
+                    legend: {
+                        display: false
+                    }
+                },
+                scales: {
+                    x: {
+                        type: 'time',
+                        time: {
+                            unit: 'month'
+                        },
+                        min: '2020-08-01',
+                        title: {
+                            display: true,
+                            text: 'Date'
+                        }
+                    },
+                    y: {
+                        min: 1,
+                        max: 5,
+                        title: {
+                            display: true,
+                            text: 'ACCR Predicted Severity Grade'
+                        },
+                        ticks: {
+                            stepSize: 1,
+                            callback: function(value) {
+                                return value;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        // Share Drop Events by Category Chart (Radar)
+        if (shareDropCategoryData.categories && shareDropCategoryData.categories.length > 0) {
+            const ctxShareDropEvents = document.getElementById('shareDropEventsChart').getContext('2d');
+            new Chart(ctxShareDropEvents, {
+                type: 'radar',
+                data: {
+                    labels: shareDropCategoryData.categories,
+                    datasets: [{
+                        label: 'Number of Events',
+                        data: shareDropCategoryData.event_counts,
+                        borderColor: '#1f77b4',
+                        backgroundColor: 'rgba(31, 119, 180, 0.25)',
+                        pointBackgroundColor: '#1f77b4',
+                        pointBorderColor: '#fff',
+                        pointHoverBackgroundColor: '#fff',
+                        pointHoverBorderColor: '#1f77b4'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'bottom'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return context.dataset.label + ': ' + context.parsed.r + ' event' + (context.parsed.r !== 1 ? 's' : '');
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        r: {
+                            beginAtZero: true,
+                            ticks: {
+                                stepSize: 1
+                            },
+                            grid: {
+                                color: 'rgba(0, 0, 0, 0.1)'
+                            }
+                        }
+                    }
+                }
+            });
+            
+            // Average Share Drop Magnitude by Category Chart (Radar)
+            const ctxAvgShareDrop = document.getElementById('avgShareDropChart').getContext('2d');
+            new Chart(ctxAvgShareDrop, {
+                type: 'radar',
+                data: {
+                    labels: shareDropCategoryData.categories,
+                    datasets: [{
+                        label: 'Average Drop (%)',
+                        data: shareDropCategoryData.avg_drops,
+                        borderColor: '#d62728',
+                        backgroundColor: 'rgba(214, 39, 40, 0.25)',
+                        pointBackgroundColor: '#d62728',
+                        pointBorderColor: '#fff',
+                        pointHoverBackgroundColor: '#fff',
+                        pointHoverBorderColor: '#d62728'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'bottom'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return context.dataset.label + ': ' + context.parsed.r.toFixed(2) + '%';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        r: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: function(value) {
+                                    return value.toFixed(1) + '%';
+                                }
+                            },
+                            grid: {
+                                color: 'rgba(0, 0, 0, 0.1)'
+                            }
+                        }
+                    }
+                }
+            });
+        }
         
         // Category Chart
         const ctx2 = document.getElementById('categoryChart').getContext('2d');
@@ -841,20 +1322,24 @@ class DashboardGenerator:
              }
          });
 
-        // Display High Impact Events
+        // Display Top 6 Most Severe Events (ACCR Perspective)
         const highImpactContainer = document.getElementById('highImpactEvents');
         if (!highImpactEventsData || highImpactEventsData.length === 0) {
-            highImpactContainer.innerHTML = '<div class="col-12"><p class="text-muted">No high impact events found.</p></div>';
+            highImpactContainer.innerHTML = '<div class="col-12"><p class="text-muted">No ACCR severity data available. Please run accr_severity_predictor.py first.</p></div>';
                  } else {
              let eventsHtml = '';
-             highImpactEventsData.slice(0, 6).forEach(event => {
+             highImpactEventsData.forEach(event => {
                  const categoriesHtml = (event.categories || []).map(cat => `<span class="category-badge">${cat}</span>`).join('');
+                 const severityGrade = event.severity_grade || 0;
+                 const severityColor = severityGrade >= 4 ? 'damage-5' : severityGrade >= 3 ? 'damage-4' : severityGrade >= 2 ? 'damage-3' : 'damage-2';
+                 const actualActionText = event.actual_action ? `<p class="mt-2 small"><strong>ACCR Actual Action:</strong> ${event.actual_action}</p>` : '';
                  eventsHtml += `
                      <div class="col-md-6 mb-4">
                          <div class="event-card">
                              <h5>${event.title || 'Untitled Event'}</h5>
                              <p class="text-muted small">${event.date ? event.date.substring(0,10) : 'No Date'}</p>
-                             <span class="damage-score damage-${event.damage_score}">Damage Score: ${event.damage_score}/5</span>
+                             <span class="damage-score ${severityColor}">ACCR Severity Grade: ${severityGrade}/5</span>
+                             ${actualActionText}
                              <div class="mt-2">${categoriesHtml}</div>
                              <p class="mt-3 small">${event.key_facts || 'No details available'}</p>
                          </div>
@@ -1309,6 +1794,10 @@ class DashboardGenerator:
             'PROTEST_VOTES_DATA_PLACEHOLDER', safe_json(protest_votes_data)
         ).replace(
             'SHARE_PRICE_DROPS_DATA_PLACEHOLDER', safe_json(share_price_drops_data)
+        ).replace(
+            'ACCR_TIMELINE_DATA_PLACEHOLDER', safe_json(accr_timeline_data)
+        ).replace(
+            'SHARE_DROP_CATEGORY_DATA_PLACEHOLDER', safe_json(share_drop_category_data or {})
         )
 
         # Inject the completed JS into the main HTML template
@@ -1336,6 +1825,12 @@ class DashboardGenerator:
 
         print("Loading share price drops data...")
         share_price_drops_data = self.load_share_price_drops_data()
+        
+        print("Preparing share drop category data...")
+        share_drop_category_data = self.prepare_share_drop_category_data()
+        
+        print("Loading ACCR severity predictions...")
+        accr_results = self.load_accr_results()
 
         if not events_data['events']:
             print("Warning: No unique events data found. Run unique_event_detection.py first.")
@@ -1344,7 +1839,7 @@ class DashboardGenerator:
             print("Warning: No share price data found. Run fetch_share_price.py first.")
 
         print("Generating HTML dashboard...")
-        html_content = self.generate_html(events_data, share_data, activism_data, share_price_drops_data)
+        html_content = self.generate_html(events_data, share_data, activism_data, share_price_drops_data, accr_results, share_drop_category_data)
 
         # Save HTML file
         with open(self.output_file, 'w', encoding='utf-8') as f:
